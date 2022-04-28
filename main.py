@@ -6,6 +6,7 @@ import time
 import warnings
 from enum import Enum
 
+import torch.utils.tensorboard
 import torch
 import torch.nn as nn
 import torch.nn.parallel
