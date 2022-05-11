@@ -6,6 +6,7 @@ import time
 import warnings
 from enum import Enum
 
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -25,20 +26,18 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
-                    help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=1, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=30, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -77,11 +76,30 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
+writer = SummaryWriter()
+
+def get_new_val():
+    with open(r"data\val\val_annotations.txt","r") as f:
+        labels = f.readlines()
+    typedic = {}
+    for i in labels:
+        filename, type = i.split("\t")[0], i.split("\t")[1] 
+        if type not in typedic:
+            typedic[type] = [filename]
+        else:
+            typedic[type] += [filename]
+    for type in typedic:
+        path = r"data\new_val\{}\image\\".format(type)
+        if not os.path.exists(path):
+            os.makedirs(path)
+        for ind,img in enumerate(typedic[type]):
+            source_file = r"data\val\images\{}".format(img)
+            target_file = r"data\new_val\{}\image\{}_{}.JPEG".format(type,type,ind)
+            shutil.copyfile(source_file,target_file)         
 
 
 def main():
     args = parser.parse_args()
-
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -137,6 +155,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+    
+    # 修改输出维度
+    input_num = model.fc.in_features
+    model.fc = nn.Linear(input_num,200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -205,16 +227,17 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    traindir = r"data\train"
+    if not os.path.exists(r"data\new_val"):
+        print("生成新的val数据集")
+        get_new_val()
+    valdir = r"data\new_val"
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -230,8 +253,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -247,13 +268,17 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        loss_train,acc5_train = train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        loss_val,acc5_val,acc1 = validate(val_loader, model, criterion, args)
         
         scheduler.step()
 
+        writer.add_scalar('Loss/train', loss_train, epoch)
+        writer.add_scalar('Loss/test', loss_val, epoch)
+        writer.add_scalar('Accuracy/train', acc5_train, epoch)
+        writer.add_scalar('Accuracy/test', acc5_val, epoch)
         
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -269,6 +294,15 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best)
+        if epoch == 5 or epoch == 10:
+             save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+                'scheduler' : scheduler.state_dict()
+            }, is_best,"checkpoint_epoch{}.pth.tar".format(epoch))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -316,6 +350,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return loss,top5.avg
 
 
 def validate(val_loader, model, criterion, args):
@@ -358,7 +393,7 @@ def validate(val_loader, model, criterion, args):
 
         progress.display_summary()
 
-    return top1.avg
+    return loss,top5.avg,top1.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
